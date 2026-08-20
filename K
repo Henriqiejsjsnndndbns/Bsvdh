@@ -1,0 +1,504 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=\n\t'
+
+# === 1) Requisitos e variáveis ===
+export DEBIAN_FRONTEND=noninteractive
+TIMEZONE="America/Sao_Paulo"
+DOMAIN="pbx.local"
+PUBLIC_IP=$(curl -s https://api.ipify.org || echo "127.0.0.1")
+
+# Credenciais (altere para as suas)
+SMTP_USER="sip_user"
+SMTP_PASS="S1p$2026!"
+DB_PASS="V01p$2026!"
+RABBIT_PASS="V01p$2026!"
+
+# Provedores (crie conta e substitua)
+TWILIO_SID="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+TWILIO_TOKEN="seu_token_twilio"
+TWILIO_NUMBER="+5511999999999"
+NEXMO_API_KEY="nexmo_key"
+NEXMO_API_SECRET="nexmo_secret"
+NEXMO_NUMBER="+5511888888888"
+
+# SMPP (ex: Bandwidth/Vonage ou provedor local)
+SMPP_HOST="smpp.provider.com"
+SMPP_USER="V01P"
+SMPP_PASS="SMPP_PASS"
+SMPP_SYSTEM_TYPE=""
+
+# === 2) Sistema e rede ===
+timedatectl set-timezone "$TIMEZONE"
+apt-get update && apt-get upgrade -y
+apt-get install -y sudo curl wget git gnupg2 lsb-release apt-transport-https ca-certificates software-properties-common dirmngr cron ufw
+
+# Firewall básico (libera SIP/RTP/Web/TLS)
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 5060/udp
+ufw allow 5061/tcp
+ufw allow 10000:20000/udp
+ufw --force enable
+
+# === 3) Docker e Docker Compose ===
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+chmod a+r /etc/apt/keyrings/docker.gpg
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# === 4) Diretórios e configuração ===
+mkdir -p /opt/voip/{asterisk,sms-gateway,scripts,certs}
+cd /opt/voip
+
+# === 5) Gerar certificados TLS (autossinados para lab; use Let's Encrypt em prod)
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /opt/voip/certs/asterisk.key \
+  -out /opt/voip/certs/asterisk.crt \
+  -subj "/CN=${DOMAIN}"
+
+# === 6) docker-compose.yml ===
+cat > /opt/voip/docker-compose.yml <<'EOF'
+version: "3.8"
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: voip
+      POSTGRES_USER: voip
+      POSTGRES_PASSWORD: V01p$2026!
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - voipnet
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    environment:
+      RABBITMQ_DEFAULT_USER: voip
+      RABBITMQ_DEFAULT_PASS: V01p$2026!
+    ports:
+      - "15672:15672"
+    networks:
+      - voipnet
+
+  asterisk:
+    image: pjproject/asterisk:latest
+    depends_on:
+      - postgres
+      - rabbitmq
+    volumes:
+      - ./asterisk:/etc/asterisk
+      - ./scripts:/scripts
+      - ./certs:/etc/asterisk/keys
+    ports:
+      - "5060:5060/udp"
+      - "5061:5061/tcp"
+      - "10000-20000:10000-20000/udp"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: voip
+      DB_USER: voip
+      DB_PASS: V01p$2026!
+    networks:
+      - voipnet
+    cap_add:
+      - NET_ADMIN
+
+  sms-gateway:
+    build: ./sms-gateway
+    depends_on:
+      - rabbitmq
+      - postgres
+    environment:
+      RABBITMQ_URL: amqp://voip:V01p$2026!@rabbitmq:5672
+      DB_URL: postgresql://voip:V01p$2026!@postgres:5432/voip
+      TWILIO_SID: ${TWILIO_SID}
+      TWILIO_TOKEN: ${TWILIO_TOKEN}
+      TWILIO_NUMBER: ${TWILIO_NUMBER}
+      NEXMO_API_KEY: ${NEXMO_API_KEY}
+      NEXMO_API_SECRET: ${NEXMO_API_SECRET}
+      NEXMO_NUMBER: ${NEXMO_NUMBER}
+      SMPP_HOST: ${SMPP_HOST}
+      SMPP_USER: ${SMPP_USER}
+      SMPP_PASS: ${SMPP_PASS}
+      SMPP_SYSTEM_TYPE: ${SMPP_SYSTEM_TYPE}
+    ports:
+      - "3000:3000"
+    networks:
+      - voipnet
+
+  wa-api:
+    image: docker.wepbx.io/wepbx/whatsapp:latest
+    depends_on:
+      - postgres
+    environment:
+      DB_HOST: postgres
+      DB_NAME: wa
+      DB_USER: wa
+      DB_PASS: W4$2026!
+      FB_APP_ID: "your-fb-app-id"
+      FB_APP_SECRET: "your-fb-app-secret"
+      FB_VERIFY_TOKEN: "verify-token-2026"
+    ports:
+      - "4444:4444"
+    networks:
+      - voipnet
+    cap_add:
+      - NET_ADMIN
+
+networks:
+  voipnet:
+    driver: bridge
+
+volumes:
+  pgdata:
+EOF
+
+# === 7) Configuração Asterisk ===
+mkdir -p /opt/voip/asterisk/pjsip.d
+cat > /opt/voip/asterisk/pjsip.conf <<'EOF'
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0
+
+[transport-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+cert_file=/etc/asterisk/keys/asterisk.crt
+priv_key_file=/etc/asterisk/keys/asterisk.key
+
+[endpoint-base]
+type=endpoint
+context=from-internal
+disallow=all
+allow=ulaw,alaw
+dtmf_mode=rfc4733
+direct_media=no
+
+[registrar]
+type=auth
+auth_type=userpass
+password=S1p$2026!
+username=voip
+
+[registrar]
+type=aor
+max_contacts=5
+
+[trunk-out]
+type=endpoint
+context=from-trunk
+disallow=all
+allow=ulaw
+dtmf_mode=rfc4733
+outbound_auth=trunk-auth
+aors=sip.provider.com
+
+[trunk-auth]
+type=auth
+auth_type=userpass
+password=TRUNK_PASS
+username=TRUNK_USER
+EOF
+
+cat > /opt/voip/asterisk/extensions.conf <<'EOF'
+[from-internal]
+exten => _X.,1,NoOp(Chamada interna para ${EXTEN})
+ same => n,Dial(PJSIP/${EXTEN},30)
+ same => n,Hangup()
+
+exten => _+55X.,1,NoOp(Ligação externa para ${EXTEN})
+ same => n,Dial(PJSIP/trunk-out/${EXTEN},60)
+ same => n,Hangup()
+
+[from-trunk]
+exten => _+55X.,1,NoOp(SMS/Chamada recebida de ${CALLERID(num)})
+ same => n,Set(MSG=${SMS})
+ same => n,System(/usr/bin/python3 /scripts/sms_handler.py "${CALLERID(num)}" "${EXTEN}" "${MSG}")
+ same => n,Hangup()
+EOF
+
+cat > /opt/voip/asterisk/modules.conf <<'EOF'
+[modules]
+autoload=yes
+preload=res_pjsip.so
+preload=res_pjsip_endpoint_identifier_user.so
+load=chan_sip.so
+load=res_rtp_asterisk.so
+load=app_dial.so
+load=func_strings.so
+load=res_agi.so
+EOF
+
+# === 8) Gateway SMS (Dockerfile + app) ===
+mkdir -p /opt/voip/sms-gateway
+cat > /opt/voip/sms-gateway/Dockerfile <<'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install flask requests smpplib pika psycopg2-binary
+COPY app.py /app/
+CMD ["python", "app.py"]
+EOF
+
+cat > /opt/voip/sms-gateway/app.py <<'PYEOF'
+import os, json, time, threading, subprocess, logging
+from flask import Flask, request, jsonify
+import requests, smpplib, pika, psycopg2
+from datetime import datetime
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Config
+DB_URL = os.getenv("DB_URL")
+RABBIT_URL = os.getenv("RABBITMQ_URL")
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
+NEXMO_KEY = os.getenv("NEXMO_API_KEY")
+NEXMO_SECRET = os.getenv("NEXMO_API_SECRET")
+NEXMO_NUMBER = os.getenv("NEXMO_NUMBER")
+SMPP_HOST = os.getenv("SMPP_HOST")
+SMPP_USER = os.getenv("SMPP_USER")
+SMPP_PASS = os.getenv("SMPP_PASS")
+SMPP_TYPE = os.getenv("SMPP_SYSTEM_TYPE", "")
+
+# DB init
+def get_conn():
+    return psycopg2.connect(DB_URL)
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS numbers(
+                    id SERIAL PRIMARY KEY,
+                    did VARCHAR(20) UNIQUE,
+                    country VARCHAR(2),
+                    status VARCHAR(10),
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS sms(
+                    id SERIAL PRIMARY KEY,
+                    src VARCHAR(20),
+                    dst VARCHAR(20),
+                    text TEXT,
+                    ts TIMESTAMP DEFAULT NOW()
+                );
+            """)
+        conn.commit()
+
+init_db()
+
+# RabbitMQ
+def rabbit_publish(queue, body):
+    try:
+        conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
+        ch = conn.channel()
+        ch.queue_declare(queue=queue, durable=True)
+        ch.basic_publish(exchange='', routing_key=queue, body=json.dumps(body))
+        conn.close()
+    except Exception as e:
+        logging.error(f"Rabbit publish error: {e}")
+
+# SMPP
+smpp_conn = None
+def smpp_start():
+    global smpp_conn
+    try:
+        smpp_conn = smpplib.client.Client(SMPP_HOST, 2775)
+        smpp_conn.set_message_received_handler(lambda pdu: on_sms_deliver(pdu))
+        smpp_conn.connect()
+        smpp_conn.bind_transceiver(system_id=SMPP_USER, password=SMPP_PASS, system_type=SMPP_TYPE)
+        logging.info("SMPP conectado")
+    except Exception as e:
+        logging.error(f"SMPP erro: {e}")
+
+def on_sms_deliver(pdu):
+    src = pdu.source_addr
+    dst = pdu.destination_addr
+    txt = pdu.short_message.message if isinstance(pdu.short_message.message, str) else pdu.short_message.message.decode()
+    logging.info(f"SMPP SMS recebido: {src} -> {dst} | {txt}")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO sms(src,dst,text) VALUES(%s,%s,%s)", (src, dst, txt))
+        conn.commit()
+    rabbit_publish("sms.in", {"src": src, "dst": dst, "text": txt})
+
+# Rotas API
+@app.route("/allocate", methods=["POST"])
+def allocate():
+    country = request.json.get("country", "BR") if request.json else "BR"
+    # Compra/renta DID via Twilio (exemplo)
+    try:
+        r = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/IncomingPhoneNumbers.json",
+            auth=(TWILIO_SID, TWILIO_TOKEN),
+            data={"PhoneNumber": TWILIO_NUMBER}
+        )
+        if r.status_code not in (200, 201):
+            logging.warning("Twilio create failed, fallback random")
+            did = f"+5511{10000000 + (hash(str(time.time())) % 90000000)}"
+        else:
+            did = r.json().get("phone_number", TWILIO_NUMBER)
+    except Exception as e:
+        logging.error(f"Twilio error: {e}")
+        did = f"+5511{10000000 + (hash(str(time.time())) % 90000000)}"
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO numbers(did,country,status) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (did, country, "active"))
+        conn.commit()
+    return jsonify({"did": did})
+
+@app.route("/sms/<did>", methods=["GET"])
+def get_sms(did):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT src,text,ts FROM sms WHERE dst=%s ORDER BY ts DESC LIMIT 20", (did,))
+            rows = [{"src": r[0], "text": r[1], "ts": r[2].isoformat()} for r in cur.fetchall()]
+    return jsonify(rows)
+
+@app.route("/sms/send", methods=["POST"])
+def send_sms():
+    data = request.json or {}
+    src, dst, text = data.get("src"), data.get("dst"), data.get("text")
+    # Envia via SMPP (exemplo)
+    if smpp_conn and smpp_conn.smpp_state == smpplib.consts.SMPP_CLIENT_STATE_BOUND_TRX:
+        smpp_conn.send_message(
+            source_addr=src,
+            destination_addr=dst,
+            short_message=text,
+            data_coding=0
+        )
+        logging.info(f"SMPP SMS enviado: {src} -> {dst}")
+    return jsonify({"status": "sent"})
+
+if __name__ == "__main__":
+    # Start SMPP thread
+    t = threading.Thread(target=smpp_start, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=3000)
+PYEOF
+
+# === 9) WhatsApp Business API bridge (script de relay) ===
+mkdir -p /opt/voip/scripts
+cat > /opt/voip/scripts/whatsapp_relay.py <<'PYEOF'
+#!/usr/bin/env python3
+import requests, json, time, logging, os, sys
+from datetime import datetime
+
+WA_API = os.getenv("WA_API_URL", "http://localhost:4444")
+SMS_API = os.getenv("SMS_API_URL", "http://localhost:3000")
+TOKEN = os.getenv("WA_TOKEN", "verify-token-2026")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+def poll_sms_and_relay():
+    """Pega SMS recebido e retransmite para WhatsApp via API"""
+    while True:
+        try:
+            r = requests.get(f"{SMS_API}/sms/+5511999999999", timeout=5)
+            if r.status_code == 200:
+                msgs = r.json()
+                for m in msgs:
+                    src = m["src"]
+                    txt = m["text"]
+                    # Reenvia para WhatsApp (exemplo: grupo ou bot)
+                    payload = {
+                        "messaging_product": "whatsapp",
+                        "to": "SEU_NUMERO_WABA",
+                        "type": "text",
+                        "text": {"body": f"[SMS {src}] {txt}"}
+                    }
+                    wh = requests.post(
+                        f"https://graph.facebook.com/v18.0/{os.getenv('WA_PHONE_ID')}/messages",
+                        headers={"Authorization": f"Bearer {os.getenv('WA_ACCESS_TOKEN')}"},
+                        json=payload
+                    )
+                    logging.info(f"Relayed SMS -> WA: {wh.status_code}")
+        except Exception as e:
+            logging.error(f"Relay error: {e}")
+        time.sleep(10)
+
+if __name__ == "__main__":
+    poll_sms_and_relay()
+PYEOF
+chmod +x /opt/voip/scripts/whatsapp_relay.py
+
+# === 10) Script de provisionamento e discagem ===
+cat > /opt/voip/scripts/provision.py <<'PYEOF'
+#!/usr/bin/env python3
+import requests, json, time, subprocess, sys, os
+
+API = "http://localhost:3000"
+AST_HOST = "pbx.local"
+
+def allocate_did():
+    r = requests.post(f"{API}/allocate", json={"country": "BR"})
+    return r.json()["did"]
+
+def register_extension(ext="100", secret="s3cr3t"):
+    cfg = f"""
+[{ext}]
+type=auth
+auth_type=userpass
+password={secret}
+username={ext}
+
+[{ext}]
+type=aor
+max_contacts=1
+
+[{ext}]
+type=endpoint
+context=from-internal
+disallow=all
+allow=ulaw
+auth=[{ext}]
+aors=[{ext}]
+"""
+    with open("/opt/voip/asterisk/pjsip.d/custom.conf", "w") as f:
+        f.write(cfg)
+    subprocess.run(["docker", "exec", "voip-asterisk-1", "asterisk", "-rx", "core", "reload"], check=False)
+    print(f"Ramal {ext} registrado")
+
+def send_sms(src, dst, body):
+    return requests.post(f"{API}/sms/send", json={"src": src, "dst": dst, "text": body}).json()
+
+if __name__ == "__main__":
+    did = allocate_did()
+    print(f"DID alocado: {did}")
+    register_extension("100", "s3cr3t")
+    print("Sistema pronto. Use softphone para registrar ramal 100/s3cr3t no IP desta máquina.")
+    print(f"Teste SMS: {send_sms(did, '+5511999999999', 'Teste VoIP real')}")
+PYEOF
+chmod +x /opt/voip/scripts/provision.py
+
+# === 11) Subir stack ===
+cd /opt/voip
+docker compose up -d
+
+# Esperar postgres e rabbit
+sleep 8
+
+# Provisionar
+python3 /opt/voip/scripts/provision.py
+
+# Iniciar relay WhatsApp em background (se tokens configurados)
+# nohup python3 /opt/voip/scripts/whatsapp_relay.py &
+
+echo "=== Setup concluído ==="
+echo "DID alocado e registrado. Gateway SMS na porta 3000."
+echo "API SMS: GET http://localhost:3000/sms/:did"
+echo "WhatsApp: configure WA_PHONE_ID e WA_ACCESS_TOKEN e rode o relay."
+echo "Asterisk CLI: docker exec -it voip-asterisk-1 asterisk -rvv"
+PYEOF
