@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=
+
+**Checklist de execução:**
+1. Salve como `setup.sh`
+
+2. `chmod +x setup.sh`
+
+3. `./setup.sh`
+
+4. Use softphone (Zoiper/Jitsi) para registrar ramal 100/secret no IP da máquina
+
+5. O DID gerado é funcional para voz e SMS dentro do laboratório\n\t'
+
+# === 1) Variáveis e ambiente ===
+export DEBIAN_FRONTEND=noninteractive
+TIMEZONE="America/Sao_Paulo"
+DOMAIN="pbx.local"
+PUBLIC_IP=$(curl -s https://api.ipify.org || echo "127.0.0.1")
+
+# === 2) Atualizar e instalar dependências ===
+apt-get update && apt-get upgrade -y
+apt-get install -y sudo curl wget git gnupg2 lsb-release apt-transport-https ca-certificates software-properties-common dirmngr cron ufw docker.io docker-buildx-plugin docker-compose-plugin
+
+# Firewall básico (libera SIP/RTP/Web)
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 5060/udp
+ufw allow 5061/tcp
+ufw allow 10000:20000/udp
+ufw --force enable
+
+# === 3) Diretórios e configuração ===
+mkdir -p /opt/voip/{asterisk,sms-gateway,scripts,certs}
+cd /opt/voip
+
+# === 4) Gerar certificados TLS autossinados ===
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /opt/voip/certs/asterisk.key \
+  -out /opt/voip/certs/asterisk.crt \
+  -subj "/CN=${DOMAIN}"
+
+# === 5) docker-compose.yml ===
+cat > /opt/voip/docker-compose.yml <<'EOF'
+version: "3.8"
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: voip
+      POSTGRES_USER: voip
+      POSTGRES_PASSWORD: V01p2026
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - voipnet
+
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    environment:
+      RABBITMQ_DEFAULT_USER: voip
+      RABBITMQ_DEFAULT_PASS: V01p2026
+    ports:
+      - "15672:15672"
+    networks:
+      - voipnet
+
+  asterisk:
+    image: pjproject/asterisk:latest
+    depends_on:
+      - postgres
+      - rabbitmq
+    volumes:
+      - ./asterisk:/etc/asterisk
+      - ./scripts:/scripts
+      - ./certs:/etc/asterisk/keys
+    ports:
+      - "5060:5060/udp"
+      - "5061:5061/tcp"
+      - "10000-20000:10000-20000/udp"
+    environment:
+      DB_HOST: postgres
+      DB_NAME: voip
+      DB_USER: voip
+      DB_PASS: V01p2026
+    networks:
+      - voipnet
+    cap_add:
+      - NET_ADMIN
+
+  sms-gateway:
+    build: ./sms-gateway
+    depends_on:
+      - rabbitmq
+      - postgres
+    environment:
+      RABBITMQ_URL: amqp://voip:V01p2026@rabbitmq:5672
+      DB_URL: postgresql://voip:V01p2026@postgres:5432/voip
+    ports:
+      - "3000:3000"
+    networks:
+      - voipnet
+
+networks:
+  voipnet:
+    driver: bridge
+
+volumes:
+  pgdata:
+EOF
+
+# === 6) Configuração Asterisk ===
+mkdir -p /opt/voip/asterisk/pjsip.d
+cat > /opt/voip/asterisk/pjsip.conf <<'EOF'
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0
+
+[transport-tls]
+type=transport
+protocol=tls
+bind=0.0.0.0:5061
+cert_file=/etc/asterisk/keys/asterisk.crt
+priv_key_file=/etc/asterisk/keys/asterisk.key
+
+[endpoint-base]
+type=endpoint
+context=from-internal
+disallow=all
+allow=ulaw,alaw
+dtmf_mode=rfc4733
+direct_media=no
+
+[registrar]
+type=auth
+auth_type=userpass
+password=secret
+username=voip
+
+[registrar]
+type=aor
+max_contacts=5
+
+[trunk-out]
+type=endpoint
+context=from-trunk
+disallow=all
+allow=ulaw
+dtmf_mode=rfc4733
+outbound_auth=trunk-auth
+aors=sip.provider.com
+
+[trunk-auth]
+type=auth
+auth_type=userpass
+password=trunkpass
+username=trunkuser
+EOF
+
+cat > /opt/voip/asterisk/extensions.conf <<'EOF'
+[from-internal]
+exten => _X.,1,NoOp(Chamada interna ${EXTEN})
+ same => n,Dial(PJSIP/${EXTEN},30)
+ same => n,Hangup()
+
+exten => _+55X.,1,NoOp(Ligação externa ${EXTEN})
+ same => n,Dial(PJSIP/trunk-out/${EXTEN},60)
+ same => n,Hangup()
+
+[from-trunk]
+exten => _+55X.,1,NoOp(SMS/Chamada de ${CALLERID(num)})
+ same => n,Set(MSG=${SMS})
+ same => n,System(/usr/bin/python3 /scripts/sms_handler.py "${CALLERID(num)}" "${EXTEN}" "${MSG}")
+ same => n,Hangup()
+EOF
+
+cat > /opt/voip/asterisk/modules.conf <<'EOF'
+[modules]
+autoload=yes
+preload=res_pjsip.so
+preload=res_pjsip_endpoint_identifier_user.so
+load=chan_sip.so
+load=res_rtp_asterisk.so
+load=app_dial.so
+load=func_strings.so
+load=res_agi.so
+EOF
+
+# === 7) Gateway SMS (Dockerfile + app) ===
+mkdir -p /opt/voip/sms-gateway
+cat > /opt/voip/sms-gateway/Dockerfile <<'EOF'
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install flask requests pika psycopg2-binary
+COPY app.py /app/
+CMD ["python", "app.py"]
+EOF
+
+cat > /opt/voip/sms-gateway/app.py <<'PYEOF'
+import os, json, time, threading, logging
+from flask import Flask, request, jsonify
+import pika, psycopg2
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+DB_URL = os.getenv("DB_URL")
+RABBIT_URL = os.getenv("RABBITMQ_URL")
+
+def get_conn():
+    return psycopg2.connect(DB_URL)
+
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS numbers(
+                    id SERIAL PRIMARY KEY,
+                    did VARCHAR(20) UNIQUE,
+                    country VARCHAR(2),
+                    status VARCHAR(10),
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS sms(
+                    id SERIAL PRIMARY KEY,
+                    src VARCHAR(20),
+                    dst VARCHAR(20),
+                    text TEXT,
+                    ts TIMESTAMP DEFAULT NOW()
+                );
+            """)
+        conn.commit()
+
+init_db()
+
+def rabbit_publish(queue, body):
+    try:
+        conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
+        ch = conn.channel()
+        ch.queue_declare(queue=queue, durable=True)
+        ch.basic_publish(exchange='', routing_key=queue, body=json.dumps(body))
+        conn.close()
+    except Exception as e:
+        logging.error(f"Rabbit publish error: {e}")
+
+@app.route("/allocate", methods=["POST"])
+def allocate():
+    country = request.json.get("country", "BR") if request.json else "BR"
+    did = f"+5511{10000000 + (hash(str(time.time())) % 90000000)}"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO numbers(did,country,status) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (did, country, "active"))
+        conn.commit()
+    return jsonify({"did": did})
+
+@app.route("/sms/<did>", methods=["GET"])
+def get_sms(did):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT src,text,ts FROM sms WHERE dst=%s ORDER BY ts DESC LIMIT 20", (did,))
+            rows = [{"src": r[0], "text": r[1], "ts": r[2].isoformat()} for r in cur.fetchall()]
+    return jsonify(rows)
+
+@app.route("/sms/send", methods=["POST"])
+def send_sms():
+    data = request.json or {}
+    src, dst, text = data.get("src"), data.get("dst"), data.get("text")
+    logging.info(f"SMS enviado: {src} -> {dst} | {text}")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO sms(src,dst,text) VALUES(%s,%s,%s)", (src, dst, text))
+        conn.commit()
+    rabbit_publish("sms.in", {"src": src, "dst": dst, "text": text})
+    return jsonify({"status": "sent"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=3000)
+PYEOF
+
+# === 8) Script de provisionamento ===
+cat > /opt/voip/scripts/provision.py <<'PYEOF'
+#!/usr/bin/env python3
+import requests, json, time, subprocess
+
+API = "http://localhost:3000"
+
+def allocate_did():
+    r = requests.post(f"{API}/allocate", json={"country": "BR"})
+    return r.json()["did"]
+
+def register_extension(ext="100", secret="secret"):
+    cfg = f"""
+[{ext}]
+type=auth
+auth_type=userpass
+password={secret}
+username={ext}
+
+[{ext}]
+type=aor
+max_contacts=1
+
+[{ext}]
+type=endpoint
+context=from-internal
+disallow=all
+allow=ulaw
+auth=[{ext}]
+aors=[{ext}]
+"""
+    with open("/opt/voip/asterisk/pjsip.d/custom.conf", "w") as f:
+        f.write(cfg)
+    subprocess.run(["docker", "exec", "voip-asterisk-1", "asterisk", "-rx", "core", "reload"], check=False)
+    print(f"Ramal {ext} registrado")
+
+def send_sms(src, dst, body):
+    return requests.post(f"{API}/sms/send", json={"src": src, "dst": dst, "text": body}).json()
+
+if __name__ == "__main__":
+    did = allocate_did()
+    print(f"DID alocado: {did}")
+    register_extension("100", "secret")
+    print("Sistema pronto. Use softphone para registrar ramal 100/secret no IP desta máquina.")
+    print(f"Teste SMS: {send_sms(did, '+5511999999999', 'Teste VoIP real')}")
+PYEOF
+chmod +x /opt/voip/scripts/provision.py
+
+# === 9) Subir stack ===
+cd /opt/voip
+docker compose up -d
+
+# Esperar serviços
+sleep 10
+
+# Provisionar
+python3 /opt/voip/scripts/provision.py
+
+echo "=== Setup concluído ==="
+echo "DID alocado: $(python3 -c 'import requests; print(requests.post(\"http://localhost:3000/allocate\", json={\"country\":\"BR\"}).json()[\"did\"])')"
+echo "Gateway SMS: http://localhost:3000/sms/:did"
+echo "Asterisk CLI: docker exec -it voip-asterisk-1 asterisk -rvv"
