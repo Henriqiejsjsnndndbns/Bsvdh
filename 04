@@ -1,0 +1,134 @@
+cat <<'SCRIPT' > /opt/setup.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Diretório base garantido
+BASE_DIR="/opt/voip"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Garante que o diretório existe antes de qualquer operação
+mkdir -p "$BASE_DIR"
+cd "$BASE_DIR"
+
+echo "[*] Iniciando setup VoIP local em $BASE_DIR..."
+
+# 1) Instala dependências base (Docker e jq para parse)
+apt-get update -qq
+apt-get install -y -qq docker.io docker-compose jq curl > /dev/null 2>&1
+
+# 2) Cria estrutura de pastas
+mkdir -p asterisk sms-gateway
+
+# 3) Docker Compose simplificado
+cat > docker-compose.yml <<'YML'
+version: "3.8"
+services:
+  asterisk:
+    image: pjproject/asterisk:latest
+    container_name: voip-asterisk
+    ports:
+      - "5060:5060/udp"
+      - "5061:5061/tcp"
+      - "10000-20000:10000-20000/udp"
+    volumes:
+      - ./asterisk:/etc/asterisk
+    cap_add:
+      - NET_ADMIN
+
+  sms-gateway:
+    image: python:3.11-slim
+    container_name: voip-sms
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./sms-gateway:/app
+    working_dir: /app
+    command: python app.py
+YML
+
+# 4) Configuração Asterisk (PJSIP real)
+cat > asterisk/pjsip.conf <<'CFG'
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0
+
+[100]
+type=auth
+auth_type=userpass
+password=1234
+username=100
+
+[100]
+type=aor
+max_contacts=1
+
+[100]
+type=endpoint
+context=default
+disallow=all
+allow=ulaw
+auth=100
+aors=100
+CFG
+
+cat > asterisk/extensions.conf <<'EXT'
+[default]
+exten => _X.,1,NoOp(Ligacao recebida)
+ same => n,Dial(PJSIP/${EXTEN},20)
+ same => n,Hangup()
+EXT
+
+# 5) Gateway SMS em Python (Gera DID realista)
+cat > sms-gateway/app.py <<'PY'
+from flask import Flask, jsonify, request
+import random
+
+app = Flask(__name__)
+
+# Gera DID realista brasileiro
+DID = f"+5511{random.randint(10000000, 99999999)}"
+sms_store = []
+
+@app.route("/allocate", methods=["POST"])
+def allocate():
+    return jsonify({"did": DID})
+
+@app.route("/sms/send", methods=["POST"])
+def send_sms():
+    d = request.json or {}
+    sms_store.append({"src": d.get("src", DID), "dst": d.get("dst"), "text": d.get("text")})
+    return jsonify({"status": "sent", "total": len(sms_store)})
+
+@app.route("/sms/<did>", methods=["GET"])
+def get_sms(did):
+    return jsonify([s for s in sms_store if s["dst"] == did])
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=3000)
+PY
+
+# 6) Sobe os containers (se Docker não estiver rodando, inicia)
+if ! systemctl is-active --quiet docker; then
+    systemctl start docker || service docker start || true
+fi
+
+docker compose up -d --remove-orphans
+
+# 7) Aguarda e testa
+sleep 5
+DID=$(curl -s -X POST http://localhost:3000/allocate | jq -r .did)
+echo "[*] DID alocado: $DID"
+
+# 8) Testa SMS
+curl -s -X POST http://localhost:3000/sms/send \
+  -H "Content-Type: application/json" \
+  -d "{\"src\":\"$DID\",\"dst\":\"+5511999999999\",\"text\":\"Teste real\"}" | jq .
+
+echo "[*] Setup finalizado."
+echo "[*] Registrar softphone: IP_DO_KALI / Ramal 100 / Senha 1234"
+echo "[*] API SMS: http://localhost:3000/sms/$DID"
+SCRIPT
+
+chmod +x /opt/setup.sh
+/opt/setup.sh
